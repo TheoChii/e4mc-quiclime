@@ -118,11 +118,11 @@ impl RoutingTable {
         Self::insert_route(lock, domain, self)
     }
 
-    fn insert_route(
+    fn insert_route<'a>(
         mut lock: parking_lot::RwLockWriteGuard<'_, HashMap<String, RouteRequestReceiver>>,
         domain: String,
-        parent: &RoutingTable,
-    ) -> Result<(RoutingHandle, RouteRequestReceiver), RegistrationError> {
+        parent: &'a RoutingTable,
+    ) -> Result<(RoutingHandle<'a>, RouteRequestReceiver), RegistrationError> {
         if lock.contains_key(&domain) {
             return Err(RegistrationError::DomainInUse);
         }
