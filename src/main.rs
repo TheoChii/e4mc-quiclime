@@ -18,7 +18,7 @@ use quinn::{
     crypto::rustls::QuicServerConfig,
     rustls::pki_types::{CertificateDer, PrivateKeyDer},
 };
-use routing::{RoutingError, RoutingTable};
+use routing::{RegistrationError, RoutingError, RoutingTable};
 use rustls_pki_types::pem::PemObject;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -36,6 +36,57 @@ mod proto;
 mod routing;
 mod unicode_madness;
 mod wordlist;
+
+struct CustomDomainPolicy {
+    token: Option<String>,
+    allowed_suffixes: Vec<String>,
+}
+
+impl CustomDomainPolicy {
+    fn from_env() -> Self {
+        let token = std::env::var("QUICLIME_CUSTOM_DOMAIN_TOKEN")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let allowed_suffixes = std::env::var("QUICLIME_CUSTOM_DOMAIN_SUFFIXES")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|suffix| {
+                let suffix = suffix.trim().trim_end_matches('.');
+                if suffix.is_empty() {
+                    None
+                } else {
+                    unicode_madness::validate_and_normalize_domain(suffix)
+                }
+            })
+            .collect();
+        Self {
+            token,
+            allowed_suffixes,
+        }
+    }
+
+    fn authorize(&self, requested_domain: &str, token: Option<&str>) -> Result<String, String> {
+        let Some(expected_token) = self.token.as_deref() else {
+            return Err("custom domains are disabled on this relay".to_string());
+        };
+        if token != Some(expected_token) {
+            return Err("invalid custom-domain token".to_string());
+        }
+
+        let Some(domain) = unicode_madness::validate_and_normalize_domain(requested_domain) else {
+            return Err("invalid custom domain".to_string());
+        };
+
+        let allowed = self.allowed_suffixes.iter().any(|suffix| {
+            domain == *suffix || domain.ends_with(&format!(".{suffix}"))
+        });
+        if !allowed {
+            return Err("custom domain is outside the relay's allowed suffixes".to_string());
+        }
+
+        Ok(domain)
+    }
+}
 
 fn get_certs() -> eyre::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let mut cert_file = std::io::BufReader::new(std::fs::File::open(
@@ -77,20 +128,25 @@ async fn main() -> eyre::Result<()> {
             .context("Reading QUICLIME_BIND_ADDR_QUIC")?
             .parse()?,
     )?));
-    // JUSTIFICATION: this lives until the end of the entire program
+    // JUSTIFICATION: these live until the end of the entire program
     let routing_table = Box::leak(Box::new(routing::RoutingTable::new(
         std::env::var("QUICLIME_BASE_DOMAIN").context("Reading QUICLIME_BASE_DOMAIN")?,
     )));
+    let custom_domain_policy = Box::leak(Box::new(CustomDomainPolicy::from_env()));
     #[allow(unreachable_code)]
     tokio::try_join!(
-        listen_quic(endpoint, routing_table),
+        listen_quic(endpoint, routing_table, custom_domain_policy),
         listen_control(endpoint, routing_table),
         listen_minecraft(routing_table)
     )?;
     Ok(())
 }
 
-async fn try_handle_quic(connection: Incoming, routing_table: &RoutingTable) -> eyre::Result<()> {
+async fn try_handle_quic(
+    connection: Incoming,
+    routing_table: &RoutingTable,
+    custom_domain_policy: &CustomDomainPolicy,
+) -> eyre::Result<()> {
     let connection = connection.await?;
     info!(
         "QUIClime connection established to: {}",
@@ -114,14 +170,64 @@ async fn try_handle_quic(connection: Incoming, routing_table: &RoutingTable) -> 
                 ServerboundControlMessage::ProbeCapabilities => {
                     let response =
                         serde_json::to_vec(&ClientboundControlMessage::HasCapabilities {
-                            caps: vec!["dialtone_sidecar".to_string()],
+                            caps: vec![
+                                "dialtone_sidecar".to_string(),
+                                "custom_domain".to_string(),
+                            ],
                         })?;
                     send_control.write_all(&[response.len() as u8]).await?;
                     send_control.write_all(&response).await?;
                     continue;
                 }
-                ServerboundControlMessage::RequestDomainAssignment => {
-                    let handle = routing_table.register();
+                ServerboundControlMessage::RequestDomainAssignment {
+                    requested_domain,
+                    token,
+                } => {
+                    let handle = if let Some(requested_domain) = requested_domain
+                        .as_deref()
+                        .filter(|domain| !domain.trim().is_empty())
+                    {
+                        match custom_domain_policy.authorize(requested_domain, token.as_deref()) {
+                            Ok(domain) => match routing_table.register_custom(&domain) {
+                                Ok(handle) => handle,
+                                Err(RegistrationError::DomainInUse) => {
+                                    let response = serde_json::to_vec(
+                                        &ClientboundControlMessage::DomainAssignmentRejected {
+                                            reason: "custom domain is already in use".to_string(),
+                                        },
+                                    )?;
+                                    send_control.write_all(&[response.len() as u8]).await?;
+                                    send_control.write_all(&response).await?;
+                                    continue;
+                                }
+                                Err(RegistrationError::InvalidDomain) => {
+                                    let response = serde_json::to_vec(
+                                        &ClientboundControlMessage::DomainAssignmentRejected {
+                                            reason: "invalid custom domain".to_string(),
+                                        },
+                                    )?;
+                                    send_control.write_all(&[response.len() as u8]).await?;
+                                    send_control.write_all(&response).await?;
+                                    continue;
+                                }
+                            },
+                            Err(reason) => {
+                                warn!(
+                                    "Rejected custom domain request from {}: {}",
+                                    connection.remote_address(),
+                                    reason
+                                );
+                                let response = serde_json::to_vec(
+                                    &ClientboundControlMessage::DomainAssignmentRejected { reason },
+                                )?;
+                                send_control.write_all(&[response.len() as u8]).await?;
+                                send_control.write_all(&response).await?;
+                                continue;
+                            }
+                        }
+                    } else {
+                        routing_table.register()
+                    };
                     info!(
                         "Domain assigned to {}: {}",
                         connection.remote_address(),
@@ -218,8 +324,12 @@ async fn try_handle_quic(connection: Incoming, routing_table: &RoutingTable) -> 
     }
 }
 
-async fn handle_quic(connection: Incoming, routing_table: &RoutingTable) {
-    if let Err(e) = try_handle_quic(connection, routing_table).await {
+async fn handle_quic(
+    connection: Incoming,
+    routing_table: &RoutingTable,
+    custom_domain_policy: &CustomDomainPolicy,
+) {
+    if let Err(e) = try_handle_quic(connection, routing_table, custom_domain_policy).await {
         error!("Error handling QUIClime connection: {:#}", e);
     };
     info!("Finished handling QUIClime connection");
@@ -228,9 +338,14 @@ async fn handle_quic(connection: Incoming, routing_table: &RoutingTable) {
 async fn listen_quic(
     endpoint: &'static Endpoint,
     routing_table: &'static RoutingTable,
+    custom_domain_policy: &'static CustomDomainPolicy,
 ) -> eyre::Result<Infallible> {
     while let Some(connection) = endpoint.accept().await {
-        tokio::spawn(handle_quic(connection, routing_table));
+        tokio::spawn(handle_quic(
+            connection,
+            routing_table,
+            custom_domain_policy,
+        ));
     }
     Err(eyre!("quiclime endpoint closed"))
 }
