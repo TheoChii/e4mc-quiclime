@@ -37,6 +37,12 @@ pub enum RoutingError {
     RateLimited,
 }
 
+#[derive(Debug)]
+pub enum RegistrationError {
+    InvalidDomain,
+    DomainInUse,
+}
+
 impl RoutingTable {
     pub fn new(base_domain: String) -> Self {
         RoutingTable {
@@ -99,16 +105,37 @@ impl RoutingTable {
         }
         domain = crate::unicode_madness::validate_and_normalize_domain(&domain)
             .expect("Resulting domain is not valid");
+        Self::insert_route(lock, domain, self).expect("random domain unexpectedly collided")
+    }
+
+    pub fn register_custom(
+        &self,
+        domain: &str,
+    ) -> Result<(RoutingHandle, RouteRequestReceiver), RegistrationError> {
+        let domain = crate::unicode_madness::validate_and_normalize_domain(domain)
+            .ok_or(RegistrationError::InvalidDomain)?;
+        let lock = self.table.write();
+        Self::insert_route(lock, domain, self)
+    }
+
+    fn insert_route(
+        mut lock: parking_lot::RwLockWriteGuard<'_, HashMap<String, RouteRequestReceiver>>,
+        domain: String,
+        parent: &RoutingTable,
+    ) -> Result<(RoutingHandle, RouteRequestReceiver), RegistrationError> {
+        if lock.contains_key(&domain) {
+            return Err(RegistrationError::DomainInUse);
+        }
         let (send, recv) = mpsc::unbounded_channel();
         lock.insert(domain.clone(), send.clone());
-        (
+        Ok((
             RoutingHandle {
                 recv,
                 domain,
-                parent: self,
+                parent,
             },
             send,
-        )
+        ))
     }
 
     pub async fn check_ticket(&self, domain: &str, ip: IpAddr) -> Option<String> {
